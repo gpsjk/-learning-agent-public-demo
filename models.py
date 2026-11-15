@@ -121,6 +121,80 @@ class PhotoExtraction(BaseModel):
         return [str(item).strip() for item in value if str(item).strip()]
 
 
+class PhotoItemExtraction(BaseModel):
+    """批量照片中拆分出的单道题，只保留照片中可见的信息。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    question_no: int = 0
+    question: str = ""
+    student_answer: str = ""
+    student_thought: str = ""
+    correct_answer: str = ""
+    subject: str = "其他"
+    source_images: list[int] = Field(default_factory=list)
+    confidence_note: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "question", "student_answer", "student_thought", "correct_answer",
+        "confidence_note", mode="before",
+    )
+    @classmethod
+    def item_text_or_empty(cls, value: Any) -> str:
+        return "" if value is None else str(value).strip()
+
+    @field_validator("subject", mode="before")
+    @classmethod
+    def item_known_subject(cls, value: Any) -> str:
+        text = "" if value is None else str(value).strip()
+        return text if text in SUBJECTS else "其他"
+
+    @field_validator("source_images", mode="before")
+    @classmethod
+    def valid_source_numbers(cls, value: Any) -> list[int]:
+        if not isinstance(value, list):
+            return []
+        numbers = []
+        for raw in value:
+            try:
+                number = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if number > 0 and number not in numbers:
+                numbers.append(number)
+        return sorted(numbers)
+
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def item_warnings(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+
+class PhotoBatchExtraction(BaseModel):
+    """一次多图片识别返回的多题批次。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    items: list[PhotoItemExtraction] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    confidence_note: str = ""
+
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def batch_warnings(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    @field_validator("confidence_note", mode="before")
+    @classmethod
+    def batch_confidence(cls, value: Any) -> str:
+        return "" if value is None else str(value).strip()
+
+
 class TeacherExercise(BaseModel):
     """教师端讲评课使用的针对性练习。"""
 

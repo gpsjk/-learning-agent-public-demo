@@ -2,3 +2,7 @@
 .env
 .venv/
 __pycache__/
+.pytest_cache/
+.superpowers/
+.tmp/
+*.pyc
