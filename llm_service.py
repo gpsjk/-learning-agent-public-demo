@@ -8,7 +8,10 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import ValidationError
 
-from models import Diagnosis, PhotoExtraction, PracticeExercise, PracticeSet, TeacherExercise, TeacherReport
+from models import (
+    Diagnosis, PhotoBatchExtraction, PhotoExtraction, PracticeExercise,
+    PracticeSet, TeacherExercise, TeacherReport,
+)
 from prompts import (
     DIAGNOSIS_SYSTEM_PROMPT,
     PHOTO_SYSTEM_PROMPT,
@@ -134,11 +137,13 @@ class LLMService:
         """拍照识别需要真实模型；演示模式只给出明确说明，不伪造识别结果。"""
         return not self.is_mock_mode and bool(self.vision_model.strip())
 
-    def extract_photo_content(self, images: list, subject: str = "") -> PhotoExtraction:
-        """把作业照片转写成文字；不臆造看不清的内容。"""
+    def extract_photo_batch(self, images: list, subject: str = "") -> PhotoBatchExtraction:
+        """把最多五张作业照片拆分为多道题；不臆造看不清的内容。"""
         usable = [image for image in images if image is not None]
         if not usable:
             raise LLMServiceError("请先拍照或选择图片，再开始识别。")
+        if len(usable) > 5:
+            raise LLMServiceError("一次最多上传 5 张照片，请分批识别。")
         if not self.vision_ready:
             raise LLMServiceError(
                 "拍照识别需要支持图片的多模态模型。请配置 OPENAI_VISION_MODEL"
@@ -155,9 +160,26 @@ class LLMService:
             "照片识别请求失败，请检查网络、多模态模型名称和密钥配置后重试。",
         )
         try:
-            return PhotoExtraction.model_validate(parse_json_object(raw))
+            parsed = parse_json_object(raw)
+            if "items" not in parsed and "question" in parsed:
+                parsed = {"items": [parsed], "warnings": parsed.get("warnings", [])}
+            return PhotoBatchExtraction.model_validate(parsed)
         except ValidationError as exc:
             raise LLMServiceError(f"照片识别结果字段格式不正确：{exc}") from exc
+
+    def extract_photo_content(self, images: list, subject: str = "") -> PhotoExtraction:
+        """兼容旧单题调用；批量结果只返回第一题。"""
+        batch = self.extract_photo_batch(images, subject)
+        if not batch.items:
+            raise LLMServiceError("照片中没有识别到题目，请重新拍摄或手动录入。")
+        first = batch.items[0]
+        return PhotoExtraction(
+            question=first.question,
+            student_answer=first.student_answer,
+            student_thought=first.student_thought,
+            subject=first.subject,
+            warnings=first.warnings,
+        )
 
     def build_teacher_report(self, stats: dict[str, Any]) -> TeacherReport:
         """根据全班错题统计生成讲评课建议。"""

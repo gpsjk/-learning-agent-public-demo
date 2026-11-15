@@ -53,6 +53,8 @@ def init_db(db_path: str | Path | None = None) -> None:
             'source_mode': "TEXT NOT NULL DEFAULT '历史数据'",
             'student_name': "TEXT NOT NULL DEFAULT ''",
             'photo_count': 'INTEGER NOT NULL DEFAULT 0',
+            'batch_id': "TEXT NOT NULL DEFAULT ''",
+            'question_no': 'INTEGER NOT NULL DEFAULT 0',
         }
         for name, definition in additions.items():
             if name not in columns:
@@ -70,6 +72,8 @@ def init_db(db_path: str | Path | None = None) -> None:
             image_base64 TEXT NOT NULL, extracted_json TEXT NOT NULL DEFAULT '{}',
             position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)''')
         connection.execute('CREATE INDEX IF NOT EXISTS idx_mistake_photos_mistake ON mistake_photos (mistake_id)')
+        connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_mistakes_batch_question
+            ON mistakes (batch_id, question_no) WHERE batch_id <> '' AND question_no > 0""")
         # Preserve prior demo exercises for recovery; only repair explicitly labelled demo data.
         connection.execute('''CREATE TABLE IF NOT EXISTS practice_repair_backup (
             mistake_id INTEGER PRIMARY KEY, practices_json TEXT NOT NULL)''')
@@ -99,9 +103,17 @@ def save_mistake(
     source_mode: str = '历史数据',
     student_name: str = '',
     photos: list[dict[str, Any]] | None = None,
+    batch_id: str = '',
+    question_no: int = 0,
     db_path: str | Path | None = None,
 ) -> int:
     init_db(db_path)
+    batch_id = str(batch_id or '').strip()[:100]
+    question_no = int(question_no or 0)
+    if batch_id and question_no > 0:
+        existing = find_batch_record(batch_id, question_no, db_path)
+        if existing is not None:
+            return int(existing['id'])
     knowledge_points = diagnosis.get("knowledge_points") or []
     error_type = str(diagnosis.get("error_type") or "基础知识不牢")
     created_at = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -111,8 +123,9 @@ def save_mistake(
             """
             INSERT INTO mistakes (
                 subject, question, student_answer, correct_answer, student_thought,
-                knowledge_points, error_type, diagnosis_json, practices_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                knowledge_points, error_type, diagnosis_json, practices_json, created_at,
+                batch_id, question_no
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 subject,
@@ -125,6 +138,8 @@ def save_mistake(
                 json.dumps(diagnosis, ensure_ascii=False),
                 json.dumps(practices, ensure_ascii=False),
                 created_at,
+                batch_id,
+                question_no,
             ),
         )
         record_id = int(cursor.lastrowid)
@@ -139,6 +154,22 @@ def save_mistake(
                  json.dumps(photo.get('extracted') or {}, ensure_ascii=False),
                  position, created_at))
         return record_id
+
+
+def find_batch_record(batch_id: str, question_no: int,
+                      db_path: str | Path | None = None) -> dict[str, Any] | None:
+    """按稳定批次题号查找已保存记录；空批次不参与幂等匹配。"""
+    normalized = str(batch_id or '').strip()
+    number = int(question_no or 0)
+    if not normalized or number <= 0:
+        return None
+    init_db(db_path)
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            'SELECT * FROM mistakes WHERE batch_id = ? AND question_no = ?',
+            (normalized, number),
+        ).fetchone()
+    return _deserialize(row) if row else None
 
 
 def list_photos(record_id: int, db_path: str | Path | None = None) -> list[dict[str, Any]]:
