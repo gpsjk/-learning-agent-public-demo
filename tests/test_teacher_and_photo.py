@@ -250,4 +250,5 @@ def test_diagnosis_page_has_photo_upload_controls(monkeypatch, tmp_path):
     assert app.file_uploader(key='photo_upload')
     assert app.button(key='photo_extract')
     assert '拍照' in app.expander[0].label
+    assert any('最多 5 张' in caption.value for caption in app.caption)
 

@@ -1,21 +1,23 @@
 import streamlit as st
+from uuid import uuid4
 
-from database import init_db, save_mistake, get_mistake
+from database import find_batch_record, init_db, save_mistake, get_mistake
 from llm_service import LLMService, LLMServiceError, to_data_url
+from photo_pipeline import included_items, merge_adjacent_items, normalize_photo_batch
 import teacher_ui as teacher
 import workspace_ui as ui
 import design
 from models import SUBJECTS
 
 
-PHOTO_LIMIT = 3
+PHOTO_LIMIT = 5
 PAGES = ["学习看板", "错题诊断", "错题本", "复习训练", "智能答疑", "教师端", "使用与设置"]
 
 
 def _photos():
     """返回本次上传的照片列表，拍照与相册选择合并，最多 PHOTO_LIMIT 张。"""
     st.markdown('**拍照或选择作业照片**')
-    st.caption('支持 JPG / PNG，最多 3 张。可只拍题目，也可拍下学生的完整作答过程。')
+    st.caption('支持 JPG / PNG，最多 5 张；可自动拆分多道题并逐题核对。')
     left, right = st.columns(2)
     with left:
         camera = st.camera_input('用摄像头拍照', key='photo_camera')
@@ -34,9 +36,9 @@ def _photos():
 def _run_extraction(service: LLMService, images, subject: str) -> None:
     try:
         with st.spinner('正在识别照片中的题目与作答……'):
-            extraction = service.extract_photo_content(images, subject)
+            extraction = service.extract_photo_batch(images, subject)
             photos = [{'name': getattr(image, 'name', '') or f'照片{index}',
-                       'mime': 'image/jpeg',
+                       'mime': getattr(image, 'type', '') or 'image/jpeg',
                        'image_base64': to_data_url(image).split(',', 1)[-1],
                        'extracted': {}}
                       for index, image in enumerate(images, start=1)]
@@ -47,9 +49,18 @@ def _run_extraction(service: LLMService, images, subject: str) -> None:
                 '也可以手动填写题目后继续使用其余功能。')
         return
     payload = extraction.model_dump()
+    batch = normalize_photo_batch(extraction, len(photos))
+    stored_payload = dict(payload)
+    if extraction.items:
+        stored_payload.update(extraction.items[0].model_dump())
     for photo in photos:
-        photo['extracted'] = payload
-    st.session_state['photo_result'] = {'extraction': payload, 'photos': photos}
+        photo['extracted'] = stored_payload
+    st.session_state['photo_result'] = {
+        'batch_id': f"photo-{uuid4().hex}",
+        'batch': batch,
+        'photos': photos,
+        'summary': {},
+    }
     st.rerun()
 
 
@@ -65,31 +76,145 @@ def _apply_result() -> None:
     st.session_state['question'] = pending['question']
     st.session_state['student_answer'] = pending['student_answer']
     st.session_state['student_thought'] = pending['student_thought']
+    st.session_state['correct_answer'] = pending.get('correct_answer', '')
     if pending['subject'] != '其他':
         st.session_state['subject'] = pending['subject']
     st.session_state['photo_recognized'] = True
 
 
-def _photo_result_panel() -> None:
+def _source_photos(result: dict, item: dict) -> list[dict]:
+    photos = result.get('photos') or []
+    if item.get('source_unknown') or not item.get('source_images'):
+        return photos
+    numbers = set(item['source_images'])
+    return [photo for index, photo in enumerate(photos, start=1) if index in numbers]
+
+
+def _process_photo_batch(service: LLMService) -> None:
     result = st.session_state.get('photo_result')
     if not result:
         return
-    extraction = result['extraction']
-    st.success(f"已识别 {len(result['photos'])} 张照片。请先核对下方文字，识别结果可能有误。")
-    for warning in extraction.get('warnings') or []:
+    batch_id = result['batch_id']
+    successes = 0
+    failures = []
+    for item in included_items(result['batch']['items']):
+        number = int(item['question_no'])
+        existing = find_batch_record(batch_id, number)
+        if existing is not None:
+            result['batch']['items'][number - 1]['saved_record_id'] = existing['id']
+            result['batch']['items'][number - 1]['error'] = ''
+            successes += 1
+            continue
+        missing = [label for label, field in (
+            ('题目', 'question'), ('学生答案', 'student_answer'), ('正确答案', 'correct_answer')
+        ) if not str(item.get(field, '')).strip()]
+        if missing:
+            message = f"请补充：{'、'.join(missing)}"
+            result['batch']['items'][number - 1]['error'] = message
+            failures.append((number, message))
+            continue
+        try:
+            diagnosis = service.diagnose(
+                item['subject'], item['question'], item['student_answer'],
+                item['correct_answer'], item.get('student_thought', ''),
+            )
+            practices = service.generate_practices(item['subject'], item['question'], diagnosis)
+            record_id = save_mistake(
+                subject=item['subject'], question=item['question'],
+                student_answer=item['student_answer'], correct_answer=item['correct_answer'],
+                student_thought=item.get('student_thought', ''),
+                diagnosis=diagnosis.model_dump(), practices=practices.model_dump(),
+                source_mode='演示数据' if service.is_mock_mode else '模型生成',
+                student_name=st.session_state.get('photo_grade_name', '').strip(),
+                photos=_source_photos(result, item), batch_id=batch_id, question_no=number,
+            )
+            result['batch']['items'][number - 1]['saved_record_id'] = record_id
+            result['batch']['items'][number - 1]['error'] = ''
+            successes += 1
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, LLMServiceError) else f"处理失败：{exc}"
+            result['batch']['items'][number - 1]['error'] = message
+            failures.append((number, message))
+    result['summary'] = {'successes': successes, 'failures': failures}
+    st.session_state['photo_result'] = result
+
+
+def _photo_result_panel(service: LLMService) -> None:
+    result = st.session_state.get('photo_result')
+    if not result:
+        return
+    batch = result['batch']
+    batch_id = result['batch_id']
+    active_count = sum(item.get('merged_into') is None for item in batch['items'])
+    st.success(f"已识别 {len(result['photos'])} 张照片并拆分出 {active_count} 道题，请逐题核对。")
+    if batch.get('confidence_note'):
+        st.caption('识别说明：' + batch['confidence_note'])
+    for warning in batch.get('warnings') or []:
         st.warning(warning)
-    if not extraction.get('student_answer', '').strip():
-        st.info('照片里没有识别到学生作答，回填后请手动补充“学生答案”和“正确答案”。')
-    if st.button('回填到下面的表单', type='primary', key='photo_fill'):
-        st.session_state['photo_pending_fill'] = extraction
-        st.rerun()
-    if st.button('清除识别结果', key='photo_clear'):
-        st.session_state.pop('photo_result', None)
-        st.rerun()
+    for index, item in enumerate(batch['items']):
+        if item.get('merged_into') is not None:
+            continue
+        number = item['question_no']
+        with st.container(border=True):
+            st.markdown(f"**第 {number} 题**")
+            sources = '、'.join(f'图片 {value}' for value in item.get('source_images') or [])
+            if item.get('source_unknown'):
+                sources = (sources + '；' if sources else '') + '来源未完全确认'
+            st.caption('来源：' + sources)
+            if item.get('confidence_note'):
+                st.caption('识别限制：' + item['confidence_note'])
+            for warning in item.get('warnings') or []:
+                st.warning(warning)
+            included = st.checkbox('包含此题', value=bool(item.get('included', True)),
+                                   key=f'photo_include_{batch_id}_{number}')
+            question = st.text_area('题目', value=item.get('question', ''),
+                                    key=f'photo_question_{batch_id}_{number}')
+            answer_left, answer_right = st.columns(2)
+            with answer_left:
+                student_answer = st.text_area('学生答案', value=item.get('student_answer', ''),
+                                              key=f'photo_answer_{batch_id}_{number}')
+            with answer_right:
+                correct_answer = st.text_area('正确答案', value=item.get('correct_answer', ''),
+                                              key=f'photo_correct_{batch_id}_{number}')
+            thought = st.text_area('解题过程或草稿', value=item.get('student_thought', ''),
+                                   key=f'photo_thought_{batch_id}_{number}')
+            subject = st.selectbox('学科', SUBJECTS,
+                                   index=SUBJECTS.index(item['subject']) if item.get('subject') in SUBJECTS else 0,
+                                   key=f'photo_subject_{batch_id}_{number}')
+            item.update(included=included, question=question, student_answer=student_answer,
+                        correct_answer=correct_answer, student_thought=thought, subject=subject)
+            if item.get('saved_record_id'):
+                st.success(f"已保存为错题 #{item['saved_record_id']}")
+            if item.get('error'):
+                st.error(item['error'])
+            has_next = any(candidate.get('merged_into') is None
+                           for candidate in batch['items'][index + 1:])
+            if has_next and st.button('与下一题合并', key=f'photo_merge_{batch_id}_{number}'):
+                batch['items'] = merge_adjacent_items(batch['items'], index)
+                st.session_state['photo_result'] = result
+                st.rerun()
+    summary = result.get('summary') or {}
+    if summary:
+        if summary.get('successes'):
+            st.success(f"本批次成功 {summary['successes']} 题。")
+        for number, message in summary.get('failures') or []:
+            st.error(f"第 {number} 题：{message}")
+    with st.container(horizontal=True):
+        if st.button('诊断并保存选中题目', type='primary', key='photo_batch_submit'):
+            _process_photo_batch(service)
+            st.rerun()
+        first = next((item for item in batch['items'] if item.get('merged_into') is None), None)
+        if first and st.button('回填第一题到单题表单', key='photo_fill'):
+            st.session_state['photo_pending_fill'] = first
+            st.rerun()
+        if st.button('清除识别结果', key='photo_clear'):
+            st.session_state.pop('photo_result', None)
+            st.rerun()
 
 
 def _reset_form_state() -> None:
     st.session_state.pop('photo_result', None)
+    st.session_state.pop('photo_pending_fill', None)
     st.session_state.pop('photo_recognized', None)
     for key in ('question', 'student_answer', 'correct_answer', 'student_thought'):
         st.session_state.pop(key, None)
@@ -176,7 +301,7 @@ def render_submission_page(service: LLMService) -> None:
             _run_extraction(service, images, photo_subject)
         if not images:
             st.caption('先拍照或选择图片，才能开始识别。')
-    _photo_result_panel()
+    _photo_result_panel(service)
 
     if st.button('填入数学示例'):
         _reset_form_state()
