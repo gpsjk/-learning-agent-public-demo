@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import tempfile
 from collections import Counter
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -10,9 +11,17 @@ from typing import Any
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
+def is_public_demo() -> bool:
+    return os.getenv("PUBLIC_DEMO", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_default_db_path() -> Path:
     configured = os.getenv("LEARNING_AGENT_DB_PATH", "").strip()
-    return Path(configured) if configured else PROJECT_DIR / "data" / "mistakes.db"
+    if configured:
+        return Path(configured)
+    if is_public_demo():
+        return Path(tempfile.gettempdir()) / "learning_agent_public_demo.db"
+    return PROJECT_DIR / "data" / "mistakes.db"
 
 
 def _connect(db_path: str | Path | None = None) -> sqlite3.Connection:

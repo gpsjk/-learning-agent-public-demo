@@ -6,3 +6,5 @@ __pycache__/
 .superpowers/
 .tmp/
 *.pyc
+data/*.db
+.streamlit/secrets.toml

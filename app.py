@@ -1,7 +1,7 @@
 import streamlit as st
 from uuid import uuid4
 
-from database import find_batch_record, init_db, save_mistake, get_mistake
+from database import find_batch_record, init_db, is_public_demo, save_mistake, get_mistake
 from llm_service import LLMService, LLMServiceError, to_data_url
 from photo_pipeline import included_items, merge_adjacent_items, normalize_photo_batch
 import teacher_ui as teacher
@@ -395,6 +395,11 @@ def render_submission_page(service: LLMService) -> None:
 def main() -> None:
     st.set_page_config(page_title="课后错题诊断", page_icon="📘", layout="wide")
     design.apply_design()
+    if is_public_demo():
+        st.warning(
+            "⚠️ 匿名公网演示：请勿上传真实学生姓名、作答或照片。"
+            "所有访客共享临时数据，应用重启后数据可能清空。"
+        )
     init_db()
     service = LLMService()
 
